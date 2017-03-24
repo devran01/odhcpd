@@ -29,3 +29,10 @@ struct ndp_neighbor {
 	uint8_t len;
 	time_t timeout;
 };
+
+struct pan_node  {
+	struct list_head head;
+	struct in6_addr destAddr;
+	int ifindex;
+	bool got_resp;
+};

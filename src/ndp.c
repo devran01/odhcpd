@@ -39,11 +39,18 @@ static void handle_solicit(void *addr, void *data, size_t len,
 static void handle_rtnetlink(void *addr, void *data, size_t len,
 		struct interface *iface, void *dest);
 static void catch_rtnetlink(int error);
+static void ping_pan(struct uloop_timeout *t);
+static void handle_ping_resp(struct uloop_fd *u, unsigned int events);
 
 static uint32_t rtnl_seqid = 0;
 static int ping_socket = -1;
+static int pan_ping_socket = -1;
 static struct odhcpd_event rtnl_event = {{.fd = -1}, handle_rtnetlink, catch_rtnetlink};
+static int pan_socket = -1;
+static struct uloop_timeout uloop_pan = {.cb = ping_pan};
+static struct uloop_fd pan_event = {.fd = -1, .cb = handle_ping_resp};
 
+struct list_head pan_nodes = LIST_HEAD_INIT(pan_nodes);
 
 // Filter ICMPv6 messages of type neighbor soliciation
 static struct sock_filter bpf[] = {
@@ -99,6 +106,30 @@ int init_ndp(void)
 	struct icmp6_filter filt;
 	ICMP6_FILTER_SETBLOCKALL(&filt);
 	setsockopt(ping_socket, IPPROTO_ICMPV6, ICMP6_FILTER, &filt, sizeof(filt));
+
+	// Open ICMPv6 socket
+	pan_ping_socket = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_ICMPV6);
+	if (pan_ping_socket < 0) {
+		syslog(LOG_ERR, "Unable to open raw socket: %s", strerror(errno));
+			return -1;
+	}
+
+	val = 2;
+	setsockopt(pan_ping_socket, IPPROTO_RAW, IPV6_CHECKSUM, &val, sizeof(val));
+
+	// This is required by RFC 4861
+	val = 255;
+	setsockopt(pan_ping_socket, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &val, sizeof(val));
+	setsockopt(pan_ping_socket, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &val, sizeof(val));
+
+	// Filter all packages, we only want to send
+	struct icmp6_filter filt1;
+	ICMP6_FILTER_SETBLOCKALL(&filt1);
+	ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt1);
+	setsockopt(pan_ping_socket, IPPROTO_ICMPV6, ICMP6_FILTER, &filt1, sizeof(filt));
+
+	pan_event.fd = pan_ping_socket;
+	uloop_fd_add(&pan_event, ULOOP_READ);
 
 
 	// Netlink socket, continued...
@@ -201,6 +232,14 @@ int setup_ndp_interface(struct interface *iface, bool enable)
 			dump_neigh_table(false);
 		else
 			dump_neigh = false;
+
+		// Setup netlink socket
+		if ((pan_socket = odhcpd_open_rtnl()) < 0)
+			syslog(LOG_ERR, "Failed to create to kernel rtnetlink: %s",
+								strerror(errno));
+
+		uloop_timeout_set(&uloop_pan,1000);
+
 	} else {
 		close(procfd);
 	}
@@ -211,21 +250,154 @@ int setup_ndp_interface(struct interface *iface, bool enable)
 	return 0;
 }
 
+static void ping_pan(struct uloop_timeout *t)
+{
+	static uint32_t panrtnl_seq = 0;
+	int route_payload_len = 0;
+	char dest_addr[INET6_ADDRSTRLEN];
+	struct in6_addr binary_dest;
+
+
+	struct pan_node *node = NULL, *tmp;
+	list_for_each_entry_safe(node, tmp, &pan_nodes, head)	{
+		if(!node->got_resp && node->destAddr.s6_addr[0])	{
+			struct interface *iface = NULL;
+			iface = odhcpd_get_interface_by_index(node->ifindex);
+			inet_ntop(AF_INET6, &node->destAddr, \
+									dest_addr, sizeof(dest_addr));
+			syslog(LOG_DEBUG, "deleting route for %s", dest_addr);
+			odhcpd_setup_route(&node->destAddr, 128, iface, NULL, 128, false);
+			list_del(&node->head);
+		}
+	}
+
+	struct req {
+		struct nlmsghdr nh;
+		struct rtmsg rtm;
+	} req = {
+		{sizeof(req), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, ++panrtnl_seq, 0},
+		{AF_INET6, 128, 0, 0, RT_TABLE_MAIN, 0, RT_SCOPE_UNIVERSE, 0, 0},
+	};
+
+	if (send(pan_socket, &req, sizeof(req), 0) < 0)
+		goto uloop_add;
+
+	uint8_t buf[8192];
+	ssize_t len = 0;
+
+	for (struct nlmsghdr *nhm = NULL; ; nhm = NLMSG_NEXT(nhm, len)) {
+		while (len < 0 || !NLMSG_OK(nhm, (size_t)len)) {
+			len = recv(pan_socket, buf, sizeof(buf), 0);
+			nhm = (struct nlmsghdr*)buf;
+			if (len < 0 || !NLMSG_OK(nhm, (size_t)len)) {
+				if (errno == EINTR)
+					continue;
+				else
+					goto uloop_add;
+			}
+		}
+
+		if (nhm->nlmsg_type != RTM_NEWROUTE && nhm->nlmsg_type != RTM_DELROUTE)
+			break;
+
+		struct rtmsg *route_info;
+		struct rtattr *route_dest;
+		route_info = (struct rtmsg *) NLMSG_DATA(nhm);
+		if (route_info == NULL)	{
+			continue;
+		}
+
+		route_dest = (struct rtattr *) RTM_RTA(route_info);
+		route_payload_len = RTM_PAYLOAD(nhm);
+		if (route_dest == NULL)	{
+			continue;
+		}
+
+		struct interface *iface = NULL;
+
+		for ( ; RTA_OK(route_dest, route_payload_len); \
+				route_dest = RTA_NEXT(route_dest, route_payload_len))	{
+
+			if (route_dest->rta_type == RTA_DST)	{
+				memcpy(&binary_dest, RTA_DATA(route_dest), sizeof(binary_dest));
+				inet_ntop(AF_INET6, &binary_dest, \
+						dest_addr, sizeof(dest_addr));
+			}
+			if (route_dest->rta_type == RTA_OIF)	{
+				int * oif = (int *) RTA_DATA(route_dest);
+				iface = odhcpd_get_interface_by_index(*oif);
+			}
+			if (route_dest->rta_type ==  RTA_PRIORITY && iface)	{
+				int * metric = (int *) RTA_DATA(route_dest);
+				if(*metric == 128 && !strncmp(iface->name, "lan", 3))	{
+					syslog(LOG_DEBUG, "Destination %s", dest_addr);
+					struct sockaddr_in6 dest = {AF_INET6, 0, 0, binary_dest, iface->ifindex};
+					struct icmp6_hdr echo = {.icmp6_type = ICMP6_ECHO_REQUEST};
+					struct iovec iov = {&echo, sizeof(echo)};
+
+					odhcpd_send(pan_ping_socket, &dest, &iov, 1, iface);
+
+					struct pan_node *node = NULL;
+					bool found = false;
+					char dest_addr1[INET6_ADDRSTRLEN];
+					list_for_each_entry(node, &pan_nodes, head)	{
+						inet_ntop(AF_INET6, &node->destAddr, \
+									dest_addr1, sizeof(dest_addr1));
+						if(!memcmp(&node->destAddr, &binary_dest, sizeof(binary_dest)))	{
+							found = true;
+							node->got_resp = false;
+							break;
+						}
+					}
+					if(!found)	{
+						node = calloc(1, sizeof(*node));
+						memcpy(&node->destAddr, &binary_dest, sizeof(binary_dest));
+						node->ifindex = iface->ifindex;
+						node->got_resp = false;
+						list_add(&node->head, &pan_nodes);
+					}
+				}
+			}
+		}
+	}
+
+uloop_add:
+	uloop_timeout_set(t,10000);
+
+}
+
 
 // Send an ICMP-ECHO. This is less for actually pinging but for the
 // neighbor cache to be kept up-to-date.
 static void ping6(struct in6_addr *addr,
 		const struct interface *iface)
 {
-	struct sockaddr_in6 dest = {AF_INET6, 0, 0, *addr, iface->ifindex};
-	struct icmp6_hdr echo = {.icmp6_type = ICMP6_ECHO_REQUEST};
-	struct iovec iov = {&echo, sizeof(echo)};
 
 	odhcpd_setup_route(addr, 128, iface, NULL, 128, true);
-	odhcpd_send(ping_socket, &dest, &iov, 1, iface);
-	odhcpd_setup_route(addr, 128, iface, NULL, 128, false);
+	if(strncmp(iface->name, "lan",3))	{
+		odhcpd_setup_route(addr, 128, iface, NULL, 128, false);
+	}
 }
 
+static void handle_ping_resp(struct uloop_fd *u, _unused unsigned int events)
+{
+	char buf[512];
+	char dest_addr[INET6_ADDRSTRLEN];
+	struct sockaddr_in6 addr;
+	socklen_t len;
+
+	recvfrom(u->fd, buf, sizeof(buf), 0, (struct sockaddr*)&addr, &len);
+	struct pan_node *node = NULL;
+	list_for_each_entry(node, &pan_nodes, head)	{
+		if(!memcmp(&node->destAddr, &addr.sin6_addr, sizeof(addr.sin6_addr)))	{
+			node->got_resp = true;
+			inet_ntop(AF_INET6, &addr.sin6_addr, \
+						dest_addr, sizeof(dest_addr));
+
+			syslog(LOG_DEBUG, "handle_ping_resp - Destination %s and node->got_resp %d", dest_addr, node->got_resp);
+		}
+	}
+}
 
 // Handle solicitations
 static void handle_solicit(void *addr, void *data, size_t len,
