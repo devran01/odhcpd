@@ -266,7 +266,7 @@ static void ping_pan(struct uloop_timeout *t)
 			inet_ntop(AF_INET6, &node->destAddr, \
 									dest_addr, sizeof(dest_addr));
 			syslog(LOG_DEBUG, "deleting route for %s", dest_addr);
-			odhcpd_setup_route(&node->destAddr, 128, iface, NULL, 128, false);
+			odhcpd_setup_route(&node->destAddr, 128, iface, NULL, 1024, false);
 			list_del(&node->head);
 		}
 	}
@@ -329,8 +329,8 @@ static void ping_pan(struct uloop_timeout *t)
 			}
 			if (route_dest->rta_type ==  RTA_PRIORITY && iface)	{
 				int * metric = (int *) RTA_DATA(route_dest);
-				if(*metric == 128 && !strncmp(iface->name, "lan", 3))	{
-					syslog(LOG_DEBUG, "Destination %s", dest_addr);
+				if(*metric == 1024 && !strncmp(iface->name, "lan", 3))	{
+					syslog(LOG_DEBUG, "ping_pan: send ping to %s", dest_addr);
 					struct sockaddr_in6 dest = {AF_INET6, 0, 0, binary_dest, iface->ifindex};
 					struct icmp6_hdr echo = {.icmp6_type = ICMP6_ECHO_REQUEST};
 					struct iovec iov = {&echo, sizeof(echo)};
@@ -362,7 +362,7 @@ static void ping_pan(struct uloop_timeout *t)
 	}
 
 uloop_add:
-	uloop_timeout_set(t,10000);
+	uloop_timeout_set(t,60000);
 
 }
 
@@ -373,10 +373,21 @@ static void ping6(struct in6_addr *addr,
 		const struct interface *iface)
 {
 
-	odhcpd_setup_route(addr, 128, iface, NULL, 128, true);
-	if(strncmp(iface->name, "lan",3))	{
+	struct sockaddr_in6 dest = {AF_INET6, 0, 0, *addr, iface->ifindex};
+	struct icmp6_hdr echo = {.icmp6_type = ICMP6_ECHO_REQUEST};
+	struct iovec iov = {&echo, sizeof(echo)};
+
+	if (!strncmp(iface->name, "lan", 3))	{
+		odhcpd_setup_route(addr, 128, iface, NULL, 128, true);
+		odhcpd_send(pan_ping_socket, &dest, &iov, 1, iface);
 		odhcpd_setup_route(addr, 128, iface, NULL, 128, false);
 	}
+	else	{
+		odhcpd_setup_route(addr, 128, iface, NULL, 128, true);
+		odhcpd_send(ping_socket, &dest, &iov, 1, iface);
+		odhcpd_setup_route(addr, 128, iface, NULL, 128, false);
+	}
+
 }
 
 static void handle_ping_resp(struct uloop_fd *u, _unused unsigned int events)
@@ -385,17 +396,31 @@ static void handle_ping_resp(struct uloop_fd *u, _unused unsigned int events)
 	char dest_addr[INET6_ADDRSTRLEN];
 	struct sockaddr_in6 addr;
 	socklen_t len;
+	bool found = false;
+	struct interface *iface = NULL;
 
 	recvfrom(u->fd, buf, sizeof(buf), 0, (struct sockaddr*)&addr, &len);
+	iface = odhcpd_get_interface_by_name("sl0");
+
 	struct pan_node *node = NULL;
 	list_for_each_entry(node, &pan_nodes, head)	{
 		if(!memcmp(&node->destAddr, &addr.sin6_addr, sizeof(addr.sin6_addr)))	{
 			node->got_resp = true;
+			found = true;
+			odhcpd_setup_route(&addr.sin6_addr, 128, iface, NULL, 1024, true);
 			inet_ntop(AF_INET6, &addr.sin6_addr, \
 						dest_addr, sizeof(dest_addr));
 
 			syslog(LOG_DEBUG, "handle_ping_resp - Destination %s and node->got_resp %d", dest_addr, node->got_resp);
 		}
+	}
+
+	if(found == false)	{
+		odhcpd_setup_route(&addr.sin6_addr, 128, iface, NULL, 1024, true);
+		inet_ntop(AF_INET6, &addr.sin6_addr, \
+						dest_addr, sizeof(dest_addr));
+
+		syslog(LOG_DEBUG, "Onetime: Added route to Destination %s ", dest_addr);
 	}
 }
 
@@ -433,10 +458,12 @@ static void handle_solicit(void *addr, void *data, size_t len,
 		return; // Looped back
 
 	struct interface *c;
-	list_for_each_entry(c, &interfaces, head)
-		if (iface->ndp == RELAYD_RELAY && iface != c &&
+	list_for_each_entry(c, &interfaces, head)	{
+		if (iface->ndp == RELAYD_RELAY && (strcmp(iface->ifname, c->ifname)) &&
+				(strcmp(c->ifname, "lo")) &&
 				(ns_is_dad || !c->external))
 			ping6(&req->nd_ns_target, c);
+	}
 }
 
 // Use rtnetlink to modify kernel routes
