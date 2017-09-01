@@ -140,6 +140,7 @@ struct interface {
 	bool ra_not_onlink;
 	bool ra_advrouter;
 	bool no_dynamic_dhcp;
+	bool support_slip;
 
 	int learn_routes;
 	int default_router;

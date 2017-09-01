@@ -45,6 +45,7 @@ enum {
 	IFACE_ATTR_PD_CER,
 	IFACE_ATTR_NDPROXY_ROUTING,
 	IFACE_ATTR_NDPROXY_SLAVE,
+	IFACE_ATTR_SUPPORT_SLIP,
 	IFACE_ATTR_MAX
 };
 
@@ -78,6 +79,7 @@ static const struct blobmsg_policy iface_attrs[IFACE_ATTR_MAX] = {
 	[IFACE_ATTR_RA_MAXINTERVAL] = { .name = "ra_maxinterval", .type = BLOBMSG_TYPE_INT32 },
 	[IFACE_ATTR_NDPROXY_ROUTING] = { .name = "ndproxy_routing", .type = BLOBMSG_TYPE_BOOL },
 	[IFACE_ATTR_NDPROXY_SLAVE] = { .name = "ndproxy_slave", .type = BLOBMSG_TYPE_BOOL },
+	[IFACE_ATTR_SUPPORT_SLIP] = { .name = "support_slip", .type = BLOBMSG_TYPE_BOOL },
 };
 
 static const struct uci_blob_param_info iface_attr_info[IFACE_ATTR_MAX] = {
@@ -572,6 +574,9 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 
 	if ((c = tb[IFACE_ATTR_NDPROXY_SLAVE]))
 		iface->external = blobmsg_get_bool(c);
+	
+	if ((c = tb[IFACE_ATTR_SUPPORT_SLIP]))
+		iface->support_slip = blobmsg_get_bool(c);
 
 	return 0;
 

@@ -107,31 +107,6 @@ int init_ndp(void)
 	ICMP6_FILTER_SETBLOCKALL(&filt);
 	setsockopt(ping_socket, IPPROTO_ICMPV6, ICMP6_FILTER, &filt, sizeof(filt));
 
-	// Open ICMPv6 socket
-	pan_ping_socket = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_ICMPV6);
-	if (pan_ping_socket < 0) {
-		syslog(LOG_ERR, "Unable to open raw socket: %s", strerror(errno));
-			return -1;
-	}
-
-	val = 2;
-	setsockopt(pan_ping_socket, IPPROTO_RAW, IPV6_CHECKSUM, &val, sizeof(val));
-
-	// This is required by RFC 4861
-	val = 255;
-	setsockopt(pan_ping_socket, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &val, sizeof(val));
-	setsockopt(pan_ping_socket, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &val, sizeof(val));
-
-	// Filter all packages, we only want to send
-	struct icmp6_filter filt1;
-	ICMP6_FILTER_SETBLOCKALL(&filt1);
-	ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt1);
-	setsockopt(pan_ping_socket, IPPROTO_ICMPV6, ICMP6_FILTER, &filt1, sizeof(filt));
-
-	pan_event.fd = pan_ping_socket;
-	uloop_fd_add(&pan_event, ULOOP_READ);
-
-
 	// Netlink socket, continued...
 	group = RTNLGRP_NEIGH;
 	setsockopt(rtnl_event.uloop.fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group));
@@ -233,12 +208,49 @@ int setup_ndp_interface(struct interface *iface, bool enable)
 		else
 			dump_neigh = false;
 
-		// Setup netlink socket
-		if ((pan_socket = odhcpd_open_rtnl()) < 0)
-			syslog(LOG_ERR, "Failed to create to kernel rtnetlink: %s",
-								strerror(errno));
+		if (iface->support_slip)	{
 
-		uloop_timeout_set(&uloop_pan,1000);
+			// Open ICMPv6 socket
+			pan_ping_socket = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_ICMPV6);
+			if (pan_ping_socket < 0) {
+				syslog(LOG_ERR, "Unable to open raw socket: %s", strerror(errno));
+					return -1;
+			}
+
+			int val = 2;
+			setsockopt(pan_ping_socket, IPPROTO_RAW, IPV6_CHECKSUM, &val, sizeof(val));
+
+			// This is required by RFC 4861
+			val = 255;
+			setsockopt(pan_ping_socket, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &val, sizeof(val));
+			setsockopt(pan_ping_socket, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &val, sizeof(val));
+
+			// Filter all packages, we only want to send
+			struct icmp6_filter filt1;
+			ICMP6_FILTER_SETBLOCKALL(&filt1);
+			ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt1);
+			setsockopt(pan_ping_socket, IPPROTO_ICMPV6, ICMP6_FILTER, &filt1, sizeof(filt1));
+
+			struct ifreq ifr;
+    		memset(&ifr, 0, sizeof(ifr));
+    		snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "sl0");
+
+			if (setsockopt(pan_ping_socket, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)))	{
+				syslog(LOG_ERR, "Unable to bind the socket to SLIP interface: %s", strerror(errno));
+				close(pan_ping_socket);
+			}
+			else	{
+				pan_event.fd = pan_ping_socket;
+				uloop_fd_add(&pan_event, ULOOP_READ);
+
+				// Setup netlink socket
+				if ((pan_socket = odhcpd_open_rtnl()) < 0)
+					syslog(LOG_ERR, "Failed to create to kernel rtnetlink: %s",
+									strerror(errno));
+
+				uloop_timeout_set(&uloop_pan,1000);
+			}
+		}
 
 	} else {
 		close(procfd);
@@ -377,7 +389,7 @@ static void ping6(struct in6_addr *addr,
 	struct icmp6_hdr echo = {.icmp6_type = ICMP6_ECHO_REQUEST};
 	struct iovec iov = {&echo, sizeof(echo)};
 
-	if (!strncmp(iface->name, "lan", 3))	{
+	if (iface->support_slip && !strncmp(iface->name, "lan", 3))	{
 		odhcpd_setup_route(addr, 128, iface, NULL, 128, true);
 		odhcpd_send(pan_ping_socket, &dest, &iov, 1, iface);
 		odhcpd_setup_route(addr, 128, iface, NULL, 128, false);
@@ -401,6 +413,9 @@ static void handle_ping_resp(struct uloop_fd *u, _unused unsigned int events)
 
 	recvfrom(u->fd, buf, sizeof(buf), 0, (struct sockaddr*)&addr, &len);
 	iface = odhcpd_get_interface_by_name("sl0");
+
+	if (!iface)
+		return;
 
 	struct pan_node *node = NULL;
 	list_for_each_entry(node, &pan_nodes, head)	{
